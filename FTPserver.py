@@ -1,135 +1,99 @@
-import socket
-import threading
-from datetime import datetime
 import json
+from datetime import datetime
+from pyftpdlib.authorizers import DummyAuthorizer
+from pyftpdlib.handlers import FTPHandler
+from pyftpdlib.servers import FTPServer
+from pyftpdlib.filesystems import AbstractedFS
+import logging
 
-# Function to load credentials from a configuration file
-def load_credentials(filename):
-    with open(filename, 'r') as file:
-        return json.load(file)
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
 
-# Load credentials at startup
-stored_credentials = load_credentials('credentials.json')
+# Load or initialize credentials
+credentials_file = 'credentials.json'
 
-# Function to handle client connections
-def handle_client(conn, address, ttl):
-    try:
-        login_attempts = 0
-        while login_attempts < 3:
-            conn.sendall(b'220 Welcome to Mock FTP Server\r\n')
-            user_command = conn.recv(1024).decode('utf-8').strip()
-            if user_command.startswith('USER'):
-                username = user_command.split(' ')[1]
-                conn.sendall(b'331 Please specify the password.\r\n')
-            else:
-                conn.sendall(b'500 Syntax error, command unrecognized.\r\n')
-                continue
+try:
+    with open(credentials_file, 'r') as f:
+        credentials = json.load(f)
+except FileNotFoundError:
+    credentials = {}
 
-            pass_command = conn.recv(1024).decode('utf-8').strip()
-            if pass_command.startswith('PASS'):
-                password = pass_command.split(' ')[1]
-            else:
-                conn.sendall(b'500 Syntax error, command unrecognized.\r\n')
-                continue
+# Function to add a user
+def add_user(username, password):
+    credentials[username] = password
+    with open(credentials_file, 'w') as f:
+        json.dump(credentials, f)
 
-            # Check credentials
-            if stored_credentials.get(username) == password:
-                log_login_attempt(username, password, address, ttl, success=True)
-                conn.sendall(b'230 Login successful.\r\n')
-                break
-            else:
-                log_login_attempt(username, password, address, ttl, success=False)
-                conn.sendall(b'530 Login incorrect.\r\n')
-                login_attempts += 1
+# Example of adding a user
+add_user('user1', 'pass1')
+add_user('user2', 'pass2')
 
-        if login_attempts >= 3:
-            conn.sendall(b'421 Too many login attempts. Connection closed.\r\n')
-    except Exception as e:
-        print(f"Exception in handle_client: {e}")
-    finally:
-        try:
-            if conn:
-                conn.shutdown(socket.SHUT_RDWR)  # Properly shutdown the socket before closing
-                conn.close()
-        except Exception as e:
-            print(f"Exception while closing the connection: {e}")
+# Custom filesystem class to handle invalid timestamps
+class CustomFS(AbstractedFS):
+    def format_mlsx(self, basedir, listing, perms, facts, ignore_err=True):
+        formatted = []
+        for entry in listing:
+            if isinstance(entry, tuple) and len(entry) == 2:
+                basename, st = entry
+                try:
+                    mtime = datetime.fromtimestamp(st.st_mtime)
+                    if mtime.year < 1970 or mtime.year > 2038:  # Handle invalid timestamps
+                        st.st_mtime = datetime.now().timestamp()
+                    formatted.append(super().format_mlsx(basedir, [(basename, st)], perms, facts, ignore_err)[0])
+                except OSError as e:
+                    if ignore_err:
+                        continue
+                    raise
+        return iter(formatted)  # Ensure the result is an iterator
 
-# Function to log login attempts
-def log_login_attempt(username, password, address, ttl, success):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    source_ip = address[0]
-    status = 'SUCCESS' if success else 'FAILURE'
-    log_line = f'{timestamp}, {source_ip}, {username}, {password}, {status}, TTL: {ttl}\n'
-    with open('ftp_logs.txt', 'a') as log_file:
-        log_file.write(log_line)
+# Create a custom authorizer class to check credentials from the JSON file
+class JSONAuthorizer(DummyAuthorizer):
+    def validate_authentication(self, username, password, handler):
+        # Log for debugging purposes
+        logging.debug(f"Validating user: {username}")
+        if username in credentials:
+            logging.debug(f"Stored password: {credentials[username]}, Provided password: {password}")
+            if credentials[username] == password:
+                return True
+        logging.debug("Authentication failed")
+        return False
 
-# Function to log port scan attempts
-def log_port_scan(address, ttl):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    source_ip = address[0]
-    log_line = f'{timestamp}, {source_ip}, Port Scan Attempt, TTL: {ttl}\n'
-    with open('ftp_logs.txt', 'a') as log_file:
-        log_file.write(log_line)
+# Custom FTP handler to enforce authentication checks with retries
+class CustomFTPHandler(FTPHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.failed_login_attempts = 0
 
-# Function to get TTL from socket (this is platform dependent and may require raw sockets)
-def get_ttl(sock):
-    try:
-        return sock.getsockopt(socket.IPPROTO_IP, socket.IP_TTL)
-    except:
-        return "Unknown"
+    def ftp_PASS(self, password):
+        username = self.username
+        logging.debug(f"Authenticating user: {username}")
+        if not self.authorizer.validate_authentication(username, password, self):
+            self.failed_login_attempts += 1
+            logging.debug(f"Failed login attempt {self.failed_login_attempts} for user: {username}")
+            self.respond("530 Authentication failed.")
+            if self.failed_login_attempts >= 3:
+                self.respond("530 Too many failed login attempts. Disconnecting.")
+                self.close_when_done()
+            return
+        logging.debug("Authentication successful.")
+        self.failed_login_attempts = 0
+        self.username = username
+        self._login_user(username)
+        self.respond("230 Login successful.")
 
-# Function to start the server
-def start_server():
-    host = "0.0.0.0"  # Listen on all interfaces
-    port = 21
-    totalClients = int(input('Enter number of clients: '))
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind((host, port))
-    sock.listen(totalClients)
-    connections = []
-    print("Initiating clients")
+def main():
+    authorizer = JSONAuthorizer()
 
-    # Accept connections
-    for i in range(totalClients):
-        try:
-            sock.settimeout(60)  # Set a timeout of 60 seconds
-            conn, address = sock.accept()
-            ttl = get_ttl(sock)
-            connections.append((conn, address, ttl))
-            print("Connected with client", i + 1)
-        except socket.timeout:
-            print("Timeout: No more clients are connecting.")
-            break
+    # Give full permissions to users in the credentials
+    for username in credentials:
+        authorizer.add_user(username, credentials[username], homedir='/', perm='elradfmw')
 
-    # Handle connections
-    for conn, address, ttl in connections:
-        try:
-            initial_data = conn.recv(1024).decode('utf-8').strip()
-            
-            if initial_data == '':
-                log_port_scan(address, ttl)
-                conn.close()
-                continue
-            
-            client_handler = threading.Thread(target=handle_client, args=(conn, address, ttl))
-            client_handler.start()
-        except Exception as e:
-            print(f"Exception while handling connection: {e}")
-            try:
-                if conn:
-                    conn.shutdown(socket.SHUT_RDWR)  # Properly shutdown the socket before closing
-                    conn.close()
-            except Exception as e:
-                print(f"Exception while closing the connection: {e}")
+    handler = CustomFTPHandler
+    handler.authorizer = authorizer
+    handler.abstracted_fs = CustomFS
 
-    # Closing connections
-    for conn, address, ttl in connections:
-        try:
-            if conn:
-                conn.shutdown(socket.SHUT_RDWR)  # Properly shutdown the socket before closing
-                conn.close()
-        except Exception as e:
-            print(f"Exception while closing the connection: {e}")
+    server = FTPServer(('0.0.0.0', 21), handler)
+    server.serve_forever()
 
-if __name__ == "__main__":
-    start_server()
+if __name__ == '__main__':
+    main()
